@@ -1,5 +1,5 @@
 [package]
-name = "ninja_websockets"
+name = "rustninja-websockets"
 version = "0.1.0"
 authors = ["David Haig <david@david>"]
 

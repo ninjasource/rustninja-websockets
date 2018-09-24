@@ -1,22 +1,40 @@
 extern crate httparse;
-extern crate ninja_websockets;
+extern crate rustninja_websockets;
 
-use ninja_websockets::websocket::*;
+use rustninja_websockets::websocket::*;
+use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::path::Path;
 
 fn main() {
-    println!("localhost listening on port 5000");
-    let listner = TcpListener::bind("127.0.0.1:5000").unwrap();
-    for stream in listner.incoming() {
-        let stream = stream.unwrap();
-        handle_connection(stream);
+    // TODO: this is a horrible way to get the www root path. Make it nicer
+    let args: Vec<_> = env::args().collect();
+    let mut www_root_path = Path::new(&args[0])
+        .parent()
+        .expect("Invalid path")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    if Path::new(&www_root_path).exists() {
+        www_root_path += "\\";
     }
+    www_root_path += "..\\..\\wwwroot";
 
-    //ninja_web_sockets::websocket::perform_handshake();
+    if Path::new(&www_root_path).exists() {
+        println!("www root path: {}", www_root_path);
+        println!("localhost listening on port 5000");
+        let listner = TcpListener::bind("127.0.0.1:5000").unwrap();
+        for stream in listner.incoming() {
+            let stream = stream.unwrap();
+            handle_connection(stream, &www_root_path);
+        }
+    } else {
+        println!("www root path not found: {}", www_root_path);
+    }
 }
 
 fn send_404(mut stream: &TcpStream) {
@@ -24,7 +42,7 @@ fn send_404(mut stream: &TcpStream) {
     stream.write(&response).expect("Write failed");
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(mut stream: TcpStream, www_root_path: &str) {
     let mut buffer: [u8; 1024] = [0; 1024];
     stream.read(&mut buffer).unwrap();
     let s: String = String::from_utf8_lossy(&buffer[..]).to_string();
@@ -64,8 +82,8 @@ fn handle_connection(mut stream: TcpStream) {
         } else {
             // not a websocket request
             if header.path == "/" {
-                let index_file =
-                    "C:\\Users\\david\\projects\\ninja_websockets\\target\\debug\\index.html";
+                let index_file = www_root_path.to_owned() + "\\index.html";
+                let index_file = index_file.as_str();
                 if let Ok(mut file) = File::open(index_file) {
                     if let Ok(metadata) = fs::metadata(index_file) {
                         let len = metadata.len();
