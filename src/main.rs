@@ -1,7 +1,7 @@
 extern crate httparse;
 extern crate rustninja_websockets;
 
-use rustninja_websockets::websocket::*;
+use rustninja_websockets::*;
 use std::env;
 use std::fs;
 use std::fs::File;
