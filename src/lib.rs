@@ -1,4 +1,29 @@
-//#![deny(warnings)]
+// ---------------------------------------------------------------------
+// Copyright 2018 David Haig
+// MIT Licence
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+// ---------------------------------------------------------------------
+
+// The library below implements version 13 of the WebSocket protocol
+// see http://tools.ietf.org/html/rfc6455 for specification
+
 #![feature(extern_prelude)]
 
 extern crate base64;
@@ -10,13 +35,13 @@ use self::crypto::digest::Digest;
 use self::crypto::sha1::Sha1;
 
 use std::collections::HashMap;
-use std::io::prelude::*;
 
 use self::byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::BufWriter;
 
 use self::rand::thread_rng;
 use self::rand::RngCore;
+use std::io::{Read, Result, Write};
 
 pub struct HttpHeader {
     pub path: String,
@@ -28,12 +53,22 @@ pub struct WebSocketContext<'a> {
     pub sec_websocket_key: String,
 }
 
-pub enum WebSocketMessageType {
-    Text = 0,
-    Binary = 1,
-    Close = 2,
+#[derive(PartialEq, Debug)]
+pub enum WebSocketSendMessageType {
+    Text = 1,
+    Binary = 2,
+    Ping = 9,
 }
 
+#[derive(PartialEq, Debug)]
+pub enum WebSocketReceiveMessageType {
+    Text = 1,
+    Binary = 2,
+    Close = 8,
+    Pong = 10,
+}
+
+#[derive(Copy, Clone)]
 pub enum WebSocketCloseStatus {
     NormalClosure = 1000,
     EndpointUnavailable = 1001,
@@ -52,7 +87,7 @@ pub struct WebSocketReadResult {
     pub end_of_message: bool,
     pub close_status: Option<WebSocketCloseStatus>,
     pub close_status_description: Option<String>,
-    pub message_type: WebSocketMessageType,
+    pub message_type: WebSocketReceiveMessageType,
 }
 
 #[derive(Copy, Clone)]
@@ -65,12 +100,23 @@ enum WebSocketOpCode {
     Pong = 10,
 }
 
+#[derive(PartialEq)]
+enum WebSocketState {
+    _None = 0,
+    _Connecting = 1,
+    Open = 2,
+    CloseSent = 3,
+    CloseReceived = 4,
+    Closed = 5,
+    _Aborted = 6,
+}
+
 impl WebSocketOpCode {
-    fn to_message_type(&self) -> WebSocketMessageType {
+    fn to_message_type(&self) -> WebSocketReceiveMessageType {
         match self {
-            WebSocketOpCode::TextFrame => WebSocketMessageType::Text,
-            WebSocketOpCode::BinaryFrame => WebSocketMessageType::Binary,
-            WebSocketOpCode::ConnectionClose => WebSocketMessageType::Close,
+            WebSocketOpCode::TextFrame => WebSocketReceiveMessageType::Text,
+            WebSocketOpCode::BinaryFrame => WebSocketReceiveMessageType::Binary,
+            WebSocketOpCode::ConnectionClose => WebSocketReceiveMessageType::Close,
             _ => panic!("Cannot convert op code to message type"),
         }
     }
@@ -145,6 +191,10 @@ pub fn read_http_header(http_header: &String) -> Option<HttpHeader> {
     }
 }
 
+fn close_status_to_u16(status: &WebSocketCloseStatus) -> u16 {
+    *status as u16
+}
+
 fn read_frame<T: Read>(stream: &mut T, buffer: &mut [u8]) -> WebSocketFrame {
     let mut small_buff: [u8; 2] = [0; 2];
     read_into_buffer(stream, &mut small_buff, 2);
@@ -180,9 +230,7 @@ fn read_frame<T: Read>(stream: &mut T, buffer: &mut [u8]) -> WebSocketFrame {
     }
 
     let frame = match op_code {
-        WebSocketOpCode::ConnectionClose => {
-            decode_close_frame(is_fin_bit_set, op_code, buffer, len)
-        }
+        WebSocketOpCode::ConnectionClose => decode_close_frame(buffer, len),
         _ => WebSocketFrame {
             count: len,
             op_code: op_code,
@@ -193,17 +241,6 @@ fn read_frame<T: Read>(stream: &mut T, buffer: &mut [u8]) -> WebSocketFrame {
     };
 
     frame
-}
-
-fn respond_to_close_frame(frame: WebSocketFrame) -> WebSocketReadResult {
-    // TODO - do this properly - we may need to respond as part of the close handshake
-    WebSocketReadResult {
-        count: frame.count,
-        close_status: frame.close_status,
-        close_status_description: frame.close_status_description,
-        end_of_message: true,
-        message_type: WebSocketMessageType::Close,
-    }
 }
 
 fn build_client_disconnected_frame() -> WebSocketFrame {
@@ -235,23 +272,57 @@ fn toggle_mask(mask_key: &[u8], buffer: &mut [u8]) {
     }
 }
 
-fn decode_close_frame(
-    _is_fin_bit_set: bool,
-    _op_code: WebSocketOpCode,
-    _buffer: &mut [u8],
-    _len: usize,
-) -> WebSocketFrame {
+fn u16_to_close_status(code: u16) -> WebSocketCloseStatus {
+    match code {
+        1000 => WebSocketCloseStatus::NormalClosure,
+        1001 => WebSocketCloseStatus::EndpointUnavailable,
+        1002 => WebSocketCloseStatus::ProtocolError,
+        1003 => WebSocketCloseStatus::InvalidMessageType,
+        1005 => WebSocketCloseStatus::Empty,
+        1007 => WebSocketCloseStatus::InvalidPayloadData,
+        1008 => WebSocketCloseStatus::PolicyViolation,
+        1009 => WebSocketCloseStatus::MessageTooBig,
+        1010 => WebSocketCloseStatus::MandatoryExtension,
+        1011 => WebSocketCloseStatus::InternalServerError,
+        _ => panic!("Unknown close status: {}", code),
+    }
+}
+
+fn decode_close_frame(buffer: &mut [u8], len: usize) -> WebSocketFrame {
+    if len >= 2 {
+        // TODO: so horrible, find a better way to extract a u16 from a slice
+        let slice = &buffer[..2];
+        let mut vec: Vec<u8> = Vec::new();
+        vec.extend(slice);
+        let mut stream = MemoryStream { buf: vec, pos: 0 };
+        let code = stream.read_u16::<BigEndian>().unwrap();
+        let close_status = u16_to_close_status(code);
+        let close_status_description = String::from_utf8_lossy(&buffer[2..len]).to_string();
+
+        return WebSocketFrame {
+            count: 0,
+            op_code: WebSocketOpCode::ConnectionClose,
+            close_status: Some(close_status),
+            close_status_description: Some(close_status_description),
+            is_fin_bit_set: false,
+        };
+    }
+
     build_client_disconnected_frame()
 }
 
 fn read_length<T: Read>(byte2: u8, stream: &mut T) -> usize {
     let len = byte2 & 0x7F;
 
-    match len {
-        126 => stream.read_u16::<BigEndian>().unwrap() as usize,
-        127 => stream.read_u64::<BigEndian>().unwrap() as usize,
-        _ => len as usize,
+    if len < 126 {
+        return len as usize;
+    } else if len == 126 {
+        return stream.read_u16::<BigEndian>().unwrap() as usize;
+    } else if len == 127 {
+        return stream.read_u64::<BigEndian>().unwrap() as usize;
     }
+
+    panic!("Invalid length: {}", len);
 }
 
 // TODO Return a Result
@@ -268,7 +339,41 @@ fn read_into_buffer<T: Read>(stream: &mut T, buffer: &mut [u8], count: u64) -> b
     success
 }
 
-fn write_frame<T: Read + Write>(
+fn respond_to_close_frame<T: Write>(
+    state: &mut WebSocketState,
+    stream: &mut T,
+    buffer: &[u8],
+    frame: WebSocketFrame,
+    is_client: bool,
+    rng: &mut rand::ThreadRng,
+) -> WebSocketReadResult {
+    if *state == WebSocketState::CloseSent {
+        // we initiated the close, this is the other party's response
+        *state = WebSocketState::Closed;
+    } else if *state == WebSocketState::Open {
+        // respond to close handshale (other party initiated close)
+        *state = WebSocketState::CloseReceived;
+        write_frame(
+            stream,
+            is_client,
+            buffer,
+            frame.count,
+            WebSocketOpCode::ConnectionClose,
+            true,
+            rng,
+        )
+    }
+
+    WebSocketReadResult {
+        count: frame.count,
+        close_status: frame.close_status,
+        close_status_description: frame.close_status_description,
+        end_of_message: true,
+        message_type: WebSocketReceiveMessageType::Close,
+    }
+}
+
+fn write_frame<T: Write>(
     stream: &mut T,
     is_client: bool,
     buffer: &[u8],
@@ -342,6 +447,7 @@ pub struct WebSocket<T: Read + Write> {
     rng: rand::ThreadRng,
     stream: T,
     continuation_frame_op_code: Option<WebSocketOpCode>,
+    state: WebSocketState,
 }
 
 impl<T: Read + Write> WebSocket<T> {
@@ -387,6 +493,28 @@ impl<T: Read + Write> WebSocket<T> {
             rng: thread_rng(),
             stream: stream,
             continuation_frame_op_code: None,
+            state: WebSocketState::Open,
+        }
+    }
+
+    pub fn close(&mut self, close_status: WebSocketCloseStatus, status_description: &str) {
+        if self.state == WebSocketState::Open {
+            self.state = WebSocketState::CloseSent;
+
+            let mut vec: Vec<u8> = vec![];
+            vec.write_u16::<BigEndian>(close_status_to_u16(&close_status))
+                .unwrap();
+            vec.extend(status_description.as_bytes());
+
+            write_frame(
+                &mut self.stream,
+                self.is_client,
+                &vec[..],
+                vec.len(),
+                WebSocketOpCode::ConnectionClose,
+                true,
+                &mut self.rng,
+            )
         }
     }
 
@@ -394,13 +522,13 @@ impl<T: Read + Write> WebSocket<T> {
         &mut self,
         buffer: &[u8],
         count: usize,
-        message_type: WebSocketMessageType,
+        message_type: WebSocketSendMessageType,
         end_of_message: bool,
     ) {
         let op_code = match message_type {
-            WebSocketMessageType::Text => WebSocketOpCode::TextFrame,
-            WebSocketMessageType::Binary => WebSocketOpCode::BinaryFrame,
-            WebSocketMessageType::Close => WebSocketOpCode::ConnectionClose,
+            WebSocketSendMessageType::Text => WebSocketOpCode::TextFrame,
+            WebSocketSendMessageType::Binary => WebSocketOpCode::BinaryFrame,
+            WebSocketSendMessageType::Ping => WebSocketOpCode::Ping,
         };
 
         write_frame(
@@ -433,24 +561,34 @@ impl<T: Read + Write> WebSocket<T> {
                     );
                     None
                 }
-                WebSocketOpCode::Pong => {
-                    // ignore pong messages for now
-                    None
-                }
-                WebSocketOpCode::ConnectionClose => Some(respond_to_close_frame(frame)),
+                WebSocketOpCode::Pong => Some(WebSocketReadResult {
+                    count: frame.count,
+                    end_of_message: frame.is_fin_bit_set,
+                    close_status: None,
+                    close_status_description: None,
+                    message_type: WebSocketReceiveMessageType::Pong,
+                }),
+                WebSocketOpCode::ConnectionClose => Some(respond_to_close_frame(
+                    &mut self.state,
+                    stream,
+                    buffer,
+                    frame,
+                    self.is_client,
+                    &mut self.rng,
+                )),
                 WebSocketOpCode::TextFrame => Some(WebSocketReadResult {
                     count: frame.count,
                     end_of_message: frame.is_fin_bit_set,
                     close_status: None,
                     close_status_description: None,
-                    message_type: WebSocketMessageType::Text,
+                    message_type: WebSocketReceiveMessageType::Text,
                 }),
                 WebSocketOpCode::BinaryFrame => Some(WebSocketReadResult {
                     count: frame.count,
                     end_of_message: frame.is_fin_bit_set,
                     close_status: None,
                     close_status_description: None,
-                    message_type: WebSocketMessageType::Binary,
+                    message_type: WebSocketReceiveMessageType::Binary,
                 }),
                 WebSocketOpCode::ContinuationFrame => Some(WebSocketReadResult {
                     count: frame.count,
@@ -471,91 +609,160 @@ impl<T: Read + Write> WebSocket<T> {
     }
 }
 
-// ************************************************************ TESTS *****************************************************************************
+// Helper class to be used as an in memory reader and writer stream
+pub struct MemoryStream {
+    buf: Vec<u8>,
+    pos: usize,
+}
 
-// WORK IN PROGRESS
-// TODO: figure out how to debug these in VS Code
+impl MemoryStream {
+    pub fn new() -> MemoryStream {
+        MemoryStream {
+            buf: vec![],
+            pos: 0,
+        }
+    }
+}
+
+impl Read for MemoryStream {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let bytes_left = self.buf.len() - self.pos;
+
+        if bytes_left <= 0 {
+            return Ok(0);
+        }
+
+        let num_bytes_to_copy = if buf.len() > bytes_left {
+            bytes_left
+        } else {
+            buf.len()
+        };
+
+        let destination = &mut buf[0..num_bytes_to_copy];
+        destination.copy_from_slice(&self.buf[self.pos..self.pos + num_bytes_to_copy]);
+        self.pos += num_bytes_to_copy;
+        return Ok(num_bytes_to_copy);
+    }
+}
+
+impl Write for MemoryStream {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.buf.extend(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+// ************************************************************************************************************************************************
+// ************************************************************ TESTS *****************************************************************************
+// ************************************************************************************************************************************************
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Result, Write};
 
-    pub struct FullDuplexMemoryStream {
-        read_stream: MemoryStream,
-        write_stream: MemoryStream,
-    }
+    #[test]
+    fn closing_handshake() {
+        let mut m = MemoryStream::new();
+        let mut buf_out: [u8; 255] = [0; 255];
+        let goodbye_message = "so long and thanks for all the fish";
 
-    impl FullDuplexMemoryStream {
-        pub fn new() -> FullDuplexMemoryStream {
-            FullDuplexMemoryStream {
-                read_stream: MemoryStream::new(),
-                write_stream: MemoryStream::new(),
-            }
-        }
-    }
-
-    // Helper class to be used as an in memory reader and writer stream
-    pub struct MemoryStream {
-        buf: Vec<u8>,
-        pos: usize,
-    }
-
-    impl MemoryStream {
-        pub fn new() -> MemoryStream {
-            MemoryStream {
-                buf: vec![],
-                pos: 0,
-            }
-        }
-    }
-
-    impl Read for MemoryStream {
-        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-            let bytes_left = self.buf.len() - self.pos;
-
-            if bytes_left <= 0 {
-                return Ok(0);
-            }
-
-            let num_bytes_to_copy = if buf.len() > bytes_left {
-                bytes_left
-            } else {
-                buf.len()
+        {
+            let mut ws = WebSocket {
+                is_client: true,
+                rng: thread_rng(),
+                stream: &mut m,
+                continuation_frame_op_code: None,
+                state: WebSocketState::Open,
             };
 
-            let destination = &mut buf[0..num_bytes_to_copy];
-            destination.copy_from_slice(&self.buf[self.pos..self.pos + num_bytes_to_copy]);
-            self.pos += num_bytes_to_copy;
-            return Ok(0);
-        }
-    }
-
-    impl Write for MemoryStream {
-        fn write(&mut self, buf: &[u8]) -> Result<usize> {
-            self.buf.extend(buf);
-            Ok(buf.len())
+            ws.close(WebSocketCloseStatus::NormalClosure, goodbye_message);
         }
 
-        fn flush(&mut self) -> Result<()> {
-            Ok(())
+        {
+            let mut ws = WebSocket {
+                is_client: !false,
+                rng: thread_rng(),
+                stream: &mut m,
+                continuation_frame_op_code: None,
+                state: WebSocketState::Open,
+            };
+
+            let result = ws.read(&mut buf_out);
+            println!("Received {} bytes", result.count);
+
+            assert_eq!(WebSocketReceiveMessageType::Close, result.message_type);
+            assert_eq!(goodbye_message, result.close_status_description.unwrap());
         }
     }
 
     #[test]
-    fn cha() {
+    fn memory_stream_works() {
         let mut m = MemoryStream::new();
+        let buf_in = "hello, world".as_bytes();
+        let mut buf_out: [u8; 255] = [0; 255];
 
-        let buf: [u8; 10] = [0; 10];
-        m.write(&buf).unwrap();
-        m.write(&buf).unwrap();
-
-        let mut buf_out: [u8; 10] = [0; 10];
-        m.read(&mut buf_out).unwrap();
+        m.write(&buf_in).unwrap();
+        match m.read(&mut buf_out) {
+            Ok(size) => {
+                println!("Size: {}", size);
+                let s = std::str::from_utf8(&buf_out[..size]).unwrap();
+                assert_eq!("hello, world", s);
+            }
+            Err(..) => assert!(false, "Failed to read stream"),
+        }
     }
 
-    //  #[test]
-    fn _server_handshake() {
-        let client_request = "Host: localhost:5000
+    fn send_test_message(from_client_to_server: bool) {
+        let mut m = MemoryStream::new();
+        let mut buf_out: [u8; 255] = [0; 255];
+        let buf_in = "hello, world".as_bytes();
+
+        {
+            let mut ws = WebSocket {
+                is_client: from_client_to_server,
+                rng: thread_rng(),
+                stream: &mut m,
+                continuation_frame_op_code: None,
+                state: WebSocketState::Open,
+            };
+
+            ws.write(buf_in, buf_in.len(), WebSocketSendMessageType::Text, true);
+        }
+
+        {
+            let mut ws = WebSocket {
+                is_client: !from_client_to_server,
+                rng: thread_rng(),
+                stream: &mut m,
+                continuation_frame_op_code: None,
+                state: WebSocketState::Open,
+            };
+
+            let result = ws.read(&mut buf_out);
+            println!("Received {} bytes", result.count);
+            let s = std::str::from_utf8(&buf_out[..result.count]).unwrap();
+            assert_eq!("hello, world", s);
+        }
+    }
+
+    #[test]
+    fn client_to_server_message() {
+        send_test_message(true);
+    }
+
+    #[test]
+    fn server_to_client_message() {
+        send_test_message(false);
+    }
+
+    #[test]
+    fn opening_handshake() {
+        let client_request = "GET /chat HTTP/1.1
+Host: localhost:5000
 User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:62.0) Gecko/20100101 Firefox/62.0
 Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
 Accept-Language: en-US,en;q=0.5
@@ -576,22 +783,27 @@ Upgrade: websocket
         println!("Request: '{}'", client_request);
 
         let header = read_http_header(&client_request).expect("Failed to read http header");
-        println!("Read http header");
         let websocket_context =
             get_websocket_context(&header).expect("Http header is not a websocket request");
-        println!("Completed decoding header");
 
         let mut stream = MemoryStream::new();
+
+        // initiate the server handshake an immediately give back ownership of the steam
+        // discard the websocket, we only want to test the handshake
         {
-            let mut _ws =
-                WebSocket::new_server(&websocket_context.sec_websocket_key, None, &mut stream);
+            WebSocket::new_server(&websocket_context.sec_websocket_key, None, &mut stream);
         }
 
-        let mut buffer: [u8; 1024] = [0; 1024];
-        stream.read(&mut buffer).unwrap();
-        let s: String = String::from_utf8_lossy(&buffer[..]).to_string();
-
-        println!("Response: {}", s);
-        assert_eq!(2 + 2, 4);
+        let mut buffer: [u8; 512] = [0; 512];
+        match stream.read(&mut buffer) {
+            Ok(size) => {
+                println!("Size: {}", size);
+                let s = std::str::from_utf8(&buffer[..size]).unwrap();
+                let client_response_expected = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: ptPnPeDOTo6khJlzmLhOZSh2tAY=\r\n\r\n";
+                println!("Response: '{}'", s);
+                assert_eq!(client_response_expected, s);
+            }
+            Err(..) => assert!(false, "Failed to read stream"),
+        }
     }
 }
