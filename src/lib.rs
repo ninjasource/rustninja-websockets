@@ -24,32 +24,27 @@
 // The library below implements version 13 of the WebSocket protocol
 // see http://tools.ietf.org/html/rfc6455 for specification
 
-#![feature(extern_prelude)]
-
 extern crate base64;
 extern crate byteorder;
 extern crate crypto;
+extern crate httparse;
 extern crate rand;
-
 use self::crypto::digest::Digest;
 use self::crypto::sha1::Sha1;
-
-use std::collections::HashMap;
-
 use self::byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::BufWriter;
-
 use self::rand::thread_rng;
 use self::rand::RngCore;
-use std::io::{Read, Result, Write};
+use std::io::{Error, ErrorKind, Read, Result, Write};
+use std::io::Cursor;
 
 pub struct HttpHeader {
     pub path: String,
-    pub headers: HashMap<String, String>,
+    pub websocket_context: Option<WebSocketContext>,
 }
 
-pub struct WebSocketContext<'a> {
-    pub sec_websocket_protocol_list: Vec<&'a str>,
+pub struct WebSocketContext {
+    pub sec_websocket_protocol_list: Vec<String>,
     pub sec_websocket_key: String,
 }
 
@@ -68,8 +63,13 @@ pub enum WebSocketReceiveMessageType {
     Pong = 10,
 }
 
-#[derive(Copy, Clone)]
-pub enum WebSocketCloseStatus {
+pub struct WebSocketCloseStatus {
+    pub code: WebSocketCloseStatusCode,
+    pub description: String,
+}
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum WebSocketCloseStatusCode {
     NormalClosure = 1000,
     EndpointUnavailable = 1001,
     ProtocolError = 1002,
@@ -86,7 +86,6 @@ pub struct WebSocketReadResult {
     pub count: usize,
     pub end_of_message: bool,
     pub close_status: Option<WebSocketCloseStatus>,
-    pub close_status_description: Option<String>,
     pub message_type: WebSocketReceiveMessageType,
 }
 
@@ -127,72 +126,74 @@ struct WebSocketFrame {
     op_code: WebSocketOpCode,
     count: usize,
     close_status: Option<WebSocketCloseStatus>,
-    close_status_description: Option<String>,
 }
 
-pub fn get_websocket_context(http_header: &HttpHeader) -> Option<WebSocketContext> {
-    let sec_websocket_protocol_list = match http_header.headers.get("Sec-WebSocket-Protocol") {
-        Some(sub_protocol_csv) => sub_protocol_csv.split(',').collect(),
-        None => Vec::new(),
-    };
+pub fn read_http_header<T: Read>(
+    stream: &mut T,
+    buffer: &mut [u8],
+) -> Result<HttpHeader> {
+    let mut num_bytes_read = 0;
 
-    let is_websocket_request: bool = match http_header.headers.get("Upgrade") {
-        Some(value) => value == "websocket",
-        None => false,
-    };
+    loop {
+        // read bytes into buffer
+        num_bytes_read += stream.read(&mut buffer[num_bytes_read..])?;
+        if num_bytes_read == 0 {
+            let e = Error::new(ErrorKind::Other, "Read zero bytes from stream");
+            return Err(e);
+        }
 
-    let sec_websocket_key = match http_header.headers.get("Sec-WebSocket-Key") {
-        Some(value) => value.to_string(),
-        None => String::new(),
-    };
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut req = httparse::Request::new(&mut headers);
+        if req
+            .parse(&mut buffer[..num_bytes_read])
+            .unwrap()
+            .is_complete()
+        {
+            let path = String::from(req.path.expect("no path specified in http header"));
+            let mut sec_websocket_protocol_list: Vec<String> = Vec::new();
+            let mut is_websocket_request = false;
+            let mut sec_websocket_key = String::new();
 
-    if is_websocket_request {
-        // TODO: check version
-        Some(WebSocketContext {
-            sec_websocket_protocol_list: sec_websocket_protocol_list,
-            sec_websocket_key: sec_websocket_key,
-        })
-    } else {
-        None
-    }
-}
-
-pub fn read_http_header(http_header: &String) -> Option<HttpHeader> {
-    let mut lines = http_header.lines();
-    let first_line = lines.next();
-
-    match first_line {
-        None => None,
-        Some(line) => {
-            let cells: Vec<_> = line.split(' ').collect();
-            if cells[0] == "GET" {
-                let path = cells[1].to_string();
-                let mut headers = HashMap::new();
-                for line in lines {
-                    if let Some(index) = line.find(':') {
-                        let key: String = line[..index].to_string();
-                        let value: String = line[index + 2..].to_string(); // TODO: possible error here if there is no header value
-                        headers.insert(key, value);
-                    } else {
-                        break;
+            for item in req.headers.iter() {
+                match item.name {
+                    "Upgrade" => {
+                        is_websocket_request = String::from_utf8_lossy(item.value).to_string() == "websocket"
+                    }
+                    "Sec-WebSocket-Protocol" => {
+                        // extract a csv list of supported sub protocols
+                        for item in String::from_utf8_lossy(item.value).to_string().split(','){
+                            sec_websocket_protocol_list.push(String::from(item));
+                        }
+                    }
+                    "Sec-WebSocket-Key" => {
+                        sec_websocket_key = String::from_utf8_lossy(item.value).to_string();
+                    }
+                    &_ => {
+                        // ignore all other headers
                     }
                 }
-
-                let header = HttpHeader {
-                    path: path,
-                    headers: headers,
-                };
-
-                Some(header)
-            } else {
-                None
             }
+
+            let websocket_context = {
+                if is_websocket_request {
+                    // TODO: check version
+                    Some(WebSocketContext {
+                        sec_websocket_protocol_list,
+                        sec_websocket_key,
+                    })
+                } else {
+                    None
+                }
+            };
+
+            let header = HttpHeader {
+                path,
+                websocket_context,
+            };
+
+            return Ok(header);
         }
     }
-}
-
-fn close_status_to_u16(status: &WebSocketCloseStatus) -> u16 {
-    *status as u16
 }
 
 fn read_frame<T: Read>(stream: &mut T, buffer: &mut [u8]) -> WebSocketFrame {
@@ -233,10 +234,9 @@ fn read_frame<T: Read>(stream: &mut T, buffer: &mut [u8]) -> WebSocketFrame {
         WebSocketOpCode::ConnectionClose => decode_close_frame(buffer, len),
         _ => WebSocketFrame {
             count: len,
-            op_code: op_code,
+            op_code,
             close_status: None,
-            close_status_description: None,
-            is_fin_bit_set: is_fin_bit_set,
+            is_fin_bit_set,
         },
     };
 
@@ -244,11 +244,11 @@ fn read_frame<T: Read>(stream: &mut T, buffer: &mut [u8]) -> WebSocketFrame {
 }
 
 fn build_client_disconnected_frame() -> WebSocketFrame {
+    let close_status = WebSocketCloseStatus {code: WebSocketCloseStatusCode::EndpointUnavailable, description: "Client disconnected".to_string()};
     WebSocketFrame {
         count: 0,
         op_code: WebSocketOpCode::ConnectionClose,
-        close_status: Some(WebSocketCloseStatus::EndpointUnavailable),
-        close_status_description: Some("Client disconnected".to_string()),
+        close_status : Some(close_status),
         is_fin_bit_set: false,
     }
 }
@@ -272,38 +272,34 @@ fn toggle_mask(mask_key: &[u8], buffer: &mut [u8]) {
     }
 }
 
-fn u16_to_close_status(code: u16) -> WebSocketCloseStatus {
+fn u16_to_close_status(code: u16) -> WebSocketCloseStatusCode {
     match code {
-        1000 => WebSocketCloseStatus::NormalClosure,
-        1001 => WebSocketCloseStatus::EndpointUnavailable,
-        1002 => WebSocketCloseStatus::ProtocolError,
-        1003 => WebSocketCloseStatus::InvalidMessageType,
-        1005 => WebSocketCloseStatus::Empty,
-        1007 => WebSocketCloseStatus::InvalidPayloadData,
-        1008 => WebSocketCloseStatus::PolicyViolation,
-        1009 => WebSocketCloseStatus::MessageTooBig,
-        1010 => WebSocketCloseStatus::MandatoryExtension,
-        1011 => WebSocketCloseStatus::InternalServerError,
+        1000 => WebSocketCloseStatusCode::NormalClosure,
+        1001 => WebSocketCloseStatusCode::EndpointUnavailable,
+        1002 => WebSocketCloseStatusCode::ProtocolError,
+        1003 => WebSocketCloseStatusCode::InvalidMessageType,
+        1005 => WebSocketCloseStatusCode::Empty,
+        1007 => WebSocketCloseStatusCode::InvalidPayloadData,
+        1008 => WebSocketCloseStatusCode::PolicyViolation,
+        1009 => WebSocketCloseStatusCode::MessageTooBig,
+        1010 => WebSocketCloseStatusCode::MandatoryExtension,
+        1011 => WebSocketCloseStatusCode::InternalServerError,
         _ => panic!("Unknown close status: {}", code),
     }
 }
 
 fn decode_close_frame(buffer: &mut [u8], len: usize) -> WebSocketFrame {
     if len >= 2 {
-        // TODO: so horrible, find a better way to extract a u16 from a slice
-        let slice = &buffer[..2];
-        let mut vec: Vec<u8> = Vec::new();
-        vec.extend(slice);
-        let mut stream = MemoryStream { buf: vec, pos: 0 };
+        let mut stream = Cursor::new(&buffer[..2]);
         let code = stream.read_u16::<BigEndian>().unwrap();
-        let close_status = u16_to_close_status(code);
+        let close_status_code = u16_to_close_status(code);
         let close_status_description = String::from_utf8_lossy(&buffer[2..len]).to_string();
 
+        let close_status = WebSocketCloseStatus {code: close_status_code, description: close_status_description};
         return WebSocketFrame {
             count: 0,
             op_code: WebSocketOpCode::ConnectionClose,
             close_status: Some(close_status),
-            close_status_description: Some(close_status_description),
             is_fin_bit_set: false,
         };
     }
@@ -351,7 +347,7 @@ fn respond_to_close_frame<T: Write>(
         // we initiated the close, this is the other party's response
         *state = WebSocketState::Closed;
     } else if *state == WebSocketState::Open {
-        // respond to close handshale (other party initiated close)
+        // respond to close handshake (other party initiated close)
         *state = WebSocketState::CloseReceived;
         write_frame(
             stream,
@@ -367,7 +363,6 @@ fn respond_to_close_frame<T: Write>(
     WebSocketReadResult {
         count: frame.count,
         close_status: frame.close_status,
-        close_status_description: frame.close_status_description,
         end_of_message: true,
         message_type: WebSocketReceiveMessageType::Close,
     }
@@ -442,20 +437,20 @@ fn write_frame<T: Write>(
     buffered_stream.flush().expect("Websocket write failed");
 }
 
-pub struct WebSocket<T: Read + Write> {
+pub struct WebSocket<'a, T: Read + Write> {
     is_client: bool,
     rng: rand::ThreadRng,
-    stream: T,
+    stream: &'a mut T,
     continuation_frame_op_code: Option<WebSocketOpCode>,
     state: WebSocketState,
 }
 
-impl<T: Read + Write> WebSocket<T> {
+impl<'a, T: Read + Write> WebSocket<'a, T> {
     pub fn new_server(
         sec_websocket_key: &String,
         sec_websocket_protocol: Option<&String>,
-        mut stream: T,
-    ) -> WebSocket<T> {
+        stream: &'a mut T,
+    ) -> WebSocket<'a, T> {
         let mut http_response = String::from(
             "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n",
         );
@@ -484,25 +479,25 @@ impl<T: Read + Write> WebSocket<T> {
         http_response.push_str("\r\n\r\n");
 
         // put the response on the wire
-        &mut stream
+        stream
             .write(http_response.as_bytes())
             .expect("Http handshake response write failed");
 
         WebSocket {
             is_client: false,
             rng: thread_rng(),
-            stream: stream,
+            stream,
             continuation_frame_op_code: None,
             state: WebSocketState::Open,
         }
     }
 
-    pub fn close(&mut self, close_status: WebSocketCloseStatus, status_description: &str) {
+    pub fn close(&mut self, close_status: WebSocketCloseStatusCode, status_description: &str) {
         if self.state == WebSocketState::Open {
             self.state = WebSocketState::CloseSent;
 
             let mut vec: Vec<u8> = vec![];
-            vec.write_u16::<BigEndian>(close_status_to_u16(&close_status))
+            vec.write_u16::<BigEndian>(close_status as u16)
                 .unwrap();
             vec.extend(status_description.as_bytes());
 
@@ -565,7 +560,6 @@ impl<T: Read + Write> WebSocket<T> {
                     count: frame.count,
                     end_of_message: frame.is_fin_bit_set,
                     close_status: None,
-                    close_status_description: None,
                     message_type: WebSocketReceiveMessageType::Pong,
                 }),
                 WebSocketOpCode::ConnectionClose => Some(respond_to_close_frame(
@@ -580,21 +574,18 @@ impl<T: Read + Write> WebSocket<T> {
                     count: frame.count,
                     end_of_message: frame.is_fin_bit_set,
                     close_status: None,
-                    close_status_description: None,
                     message_type: WebSocketReceiveMessageType::Text,
                 }),
                 WebSocketOpCode::BinaryFrame => Some(WebSocketReadResult {
                     count: frame.count,
                     end_of_message: frame.is_fin_bit_set,
                     close_status: None,
-                    close_status_description: None,
                     message_type: WebSocketReceiveMessageType::Binary,
                 }),
                 WebSocketOpCode::ContinuationFrame => Some(WebSocketReadResult {
                     count: frame.count,
                     end_of_message: frame.is_fin_bit_set,
                     close_status: None,
-                    close_status_description: None,
                     message_type: self
                         .continuation_frame_op_code
                         .expect("Continuation frame received before a text or binary frame")
@@ -609,53 +600,6 @@ impl<T: Read + Write> WebSocket<T> {
     }
 }
 
-// Helper class to be used as an in memory reader and writer stream
-pub struct MemoryStream {
-    buf: Vec<u8>,
-    pos: usize,
-}
-
-impl MemoryStream {
-    pub fn new() -> MemoryStream {
-        MemoryStream {
-            buf: vec![],
-            pos: 0,
-        }
-    }
-}
-
-impl Read for MemoryStream {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let bytes_left = self.buf.len() - self.pos;
-
-        if bytes_left <= 0 {
-            return Ok(0);
-        }
-
-        let num_bytes_to_copy = if buf.len() > bytes_left {
-            bytes_left
-        } else {
-            buf.len()
-        };
-
-        let destination = &mut buf[0..num_bytes_to_copy];
-        destination.copy_from_slice(&self.buf[self.pos..self.pos + num_bytes_to_copy]);
-        self.pos += num_bytes_to_copy;
-        return Ok(num_bytes_to_copy);
-    }
-}
-
-impl Write for MemoryStream {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.buf.extend(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
 // ************************************************************************************************************************************************
 // ************************************************************ TESTS *****************************************************************************
 // ************************************************************************************************************************************************
@@ -663,101 +607,8 @@ impl Write for MemoryStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn closing_handshake() {
-        let mut m = MemoryStream::new();
-        let mut buf_out: [u8; 255] = [0; 255];
-        let goodbye_message = "so long and thanks for all the fish";
-
-        {
-            let mut ws = WebSocket {
-                is_client: true,
-                rng: thread_rng(),
-                stream: &mut m,
-                continuation_frame_op_code: None,
-                state: WebSocketState::Open,
-            };
-
-            ws.close(WebSocketCloseStatus::NormalClosure, goodbye_message);
-        }
-
-        {
-            let mut ws = WebSocket {
-                is_client: !false,
-                rng: thread_rng(),
-                stream: &mut m,
-                continuation_frame_op_code: None,
-                state: WebSocketState::Open,
-            };
-
-            let result = ws.read(&mut buf_out);
-            println!("Received {} bytes", result.count);
-
-            assert_eq!(WebSocketReceiveMessageType::Close, result.message_type);
-            assert_eq!(goodbye_message, result.close_status_description.unwrap());
-        }
-    }
-
-    #[test]
-    fn memory_stream_works() {
-        let mut m = MemoryStream::new();
-        let buf_in = "hello, world".as_bytes();
-        let mut buf_out: [u8; 255] = [0; 255];
-
-        m.write(&buf_in).unwrap();
-        match m.read(&mut buf_out) {
-            Ok(size) => {
-                println!("Size: {}", size);
-                let s = std::str::from_utf8(&buf_out[..size]).unwrap();
-                assert_eq!("hello, world", s);
-            }
-            Err(..) => assert!(false, "Failed to read stream"),
-        }
-    }
-
-    fn send_test_message(from_client_to_server: bool) {
-        let mut m = MemoryStream::new();
-        let mut buf_out: [u8; 255] = [0; 255];
-        let buf_in = "hello, world".as_bytes();
-
-        {
-            let mut ws = WebSocket {
-                is_client: from_client_to_server,
-                rng: thread_rng(),
-                stream: &mut m,
-                continuation_frame_op_code: None,
-                state: WebSocketState::Open,
-            };
-
-            ws.write(buf_in, buf_in.len(), WebSocketSendMessageType::Text, true);
-        }
-
-        {
-            let mut ws = WebSocket {
-                is_client: !from_client_to_server,
-                rng: thread_rng(),
-                stream: &mut m,
-                continuation_frame_op_code: None,
-                state: WebSocketState::Open,
-            };
-
-            let result = ws.read(&mut buf_out);
-            println!("Received {} bytes", result.count);
-            let s = std::str::from_utf8(&buf_out[..result.count]).unwrap();
-            assert_eq!("hello, world", s);
-        }
-    }
-
-    #[test]
-    fn client_to_server_message() {
-        send_test_message(true);
-    }
-
-    #[test]
-    fn server_to_client_message() {
-        send_test_message(false);
-    }
+    use std::io::Cursor;
+    use std::io::{Read, Write};
 
     #[test]
     fn opening_handshake() {
@@ -779,31 +630,120 @@ Upgrade: websocket
 
 ";
 
-        let client_request = String::from(client_request);
-        println!("Request: '{}'", client_request);
-
-        let header = read_http_header(&client_request).expect("Failed to read http header");
-        let websocket_context =
-            get_websocket_context(&header).expect("Http header is not a websocket request");
-
-        let mut stream = MemoryStream::new();
+        let network_buffer: Vec<u8> = Vec::new();
+        let mut stream = Cursor::new(network_buffer);
+        stream.write(client_request.as_bytes()).unwrap(); // write the header to the network stream
+        stream.set_position(0);
+        let mut receive_buffer: [u8; 2048] = [0; 2048];
+        let header = read_http_header(&mut stream, &mut receive_buffer).expect("Failed to read http header");
+        let websocket_context = header.websocket_context.expect("Http header is not a websocket request");
 
         // initiate the server handshake an immediately give back ownership of the steam
         // discard the websocket, we only want to test the handshake
+        let position = stream.position();
         {
             WebSocket::new_server(&websocket_context.sec_websocket_key, None, &mut stream);
         }
+        stream.set_position(position);
 
-        let mut buffer: [u8; 512] = [0; 512];
-        match stream.read(&mut buffer) {
+        //let mut receive_buffer: [u8; 512] = [0; 512];
+        match stream.read(&mut receive_buffer) {
             Ok(size) => {
                 println!("Size: {}", size);
-                let s = std::str::from_utf8(&buffer[..size]).unwrap();
+                let s = std::str::from_utf8(&receive_buffer[..size]).unwrap();
                 let client_response_expected = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: ptPnPeDOTo6khJlzmLhOZSh2tAY=\r\n\r\n";
                 println!("Response: '{}'", s);
                 assert_eq!(client_response_expected, s);
             }
             Err(..) => assert!(false, "Failed to read stream"),
+        }
+    }
+
+    #[test]
+    fn client_to_server_message() {
+        send_test_message(true);
+    }
+
+    #[test]
+    fn server_to_client_message() {
+        send_test_message(false);
+    }
+
+    #[test]
+    fn closing_handshake() {
+        //let mut m = MemoryStream::new();
+        let b: Vec<u8> = vec![];
+        let mut stream = Cursor::new(b);
+        let mut buf_out: [u8; 255] = [0; 255];
+        let goodbye_message = "so long and thanks for all the fish";
+
+        {
+            let mut ws = WebSocket {
+                is_client: true,
+                rng: thread_rng(),
+                stream: &mut stream,
+                continuation_frame_op_code: None,
+                state: WebSocketState::Open,
+            };
+
+            ws.close(WebSocketCloseStatusCode::NormalClosure, goodbye_message);
+        }
+
+        stream.set_position(0);
+
+        {
+            let mut ws = WebSocket {
+                is_client: !false,
+                rng: thread_rng(),
+                stream: &mut stream,
+                continuation_frame_op_code: None,
+                state: WebSocketState::Open,
+            };
+
+            let result = ws.read(&mut buf_out);
+            println!("Received {} bytes", result.count);
+
+            assert_eq!(WebSocketReceiveMessageType::Close, result.message_type);
+            let close_status = result.close_status.unwrap();
+            assert_eq!(WebSocketCloseStatusCode::NormalClosure, close_status.code);
+            assert_eq!(goodbye_message, close_status.description);
+        }
+    }
+
+    fn send_test_message(from_client_to_server: bool) {
+        let b: Vec<u8> = vec![];
+        let mut stream = Cursor::new(b);
+        //let mut m = MemoryStream::new();
+        let mut buf_out: [u8; 255] = [0; 255];
+        let buf_in = "hello, world".as_bytes();
+
+        {
+            let mut ws = WebSocket {
+                is_client: from_client_to_server,
+                rng: thread_rng(),
+                stream: &mut stream,
+                continuation_frame_op_code: None,
+                state: WebSocketState::Open,
+            };
+
+            ws.write(buf_in, buf_in.len(), WebSocketSendMessageType::Text, true);
+        }
+
+        stream.set_position(0);
+
+        {
+            let mut ws = WebSocket {
+                is_client: !from_client_to_server,
+                rng: thread_rng(),
+                stream: &mut stream,
+                continuation_frame_op_code: None,
+                state: WebSocketState::Open,
+            };
+
+            let result = ws.read(&mut buf_out);
+            println!("Received {} bytes", result.count);
+            let s = std::str::from_utf8(&buf_out[..result.count]).unwrap();
+            assert_eq!("hello, world", s);
         }
     }
 }

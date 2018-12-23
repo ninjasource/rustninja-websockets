@@ -1,4 +1,3 @@
-extern crate httparse;
 extern crate websockets;
 
 use std::env;
@@ -27,13 +26,17 @@ fn main() {
     if Path::new(&www_root_path).exists() {
         println!("www root path: {}", www_root_path);
         println!("localhost listening on port 5000");
-        let listner = TcpListener::bind("127.0.0.1:5000").unwrap();
-        for stream in listner.incoming() {
-            let stream = stream.unwrap();
-            handle_connection(stream, &www_root_path);
+        let listener = TcpListener::bind("127.0.0.1:5000").unwrap();
+        for stream in listener.incoming() {
+            println!("TCP/IP connection opened");
+            let mut stream = stream.unwrap();
+            match handle_connection(stream, &www_root_path) {
+                Ok(()) => println!("TCP/IP connection closed"),
+                Err(e) => eprintln!("TCP/IP connection closed due to error: {}", e),
+            }
         }
     } else {
-        println!("www root path not found: {}", www_root_path);
+        eprintln!("www root path not found: {}", www_root_path);
     }
 }
 
@@ -42,39 +45,33 @@ fn send_404(mut stream: &TcpStream) {
     stream.write(&response).expect("Write failed");
 }
 
-fn handle_connection(mut stream: TcpStream, www_root_path: &str) {
-    let mut buffer: [u8; 1024] = [0; 1024];
-    stream.read(&mut buffer).unwrap();
-    let s: String = String::from_utf8_lossy(&buffer[..]).to_string();
-    let http_header = read_http_header(&s);
+fn handle_connection(mut stream: TcpStream, www_root_path: &str) -> Result<(), std::io::Error> {
+    let mut buffer: [u8; 2048] = [0; 2048];
+    let header = read_http_header(&mut stream, &mut buffer)?;
 
-    println!("Request: '{}'", s);
-
-    if let Some(header) = http_header {
-        println!("Completed reading http header");
-        if let Some(websocket_context) = get_websocket_context(&header) {
-            handle_websocket_request(websocket_context, stream, buffer);
-        } else {
-            handle_file_request(&header, www_root_path, stream);
-        }
+    if let Some(websocket_context) = header.websocket_context {
+        handle_websocket_request(websocket_context, stream, &mut buffer);
     } else {
-        println!("FAILED");
+        handle_file_request(&header.path, www_root_path, stream);
     }
+
+    Ok(())
 }
 
 fn handle_websocket_request(
     websocket_context: WebSocketContext,
-    stream: TcpStream,
-    mut buffer: [u8; 1024],
+    mut stream: TcpStream,
+    buffer: &mut [u8],
 ) {
     println!("This is a websocket request. Responding to handshake");
-    let mut ws = WebSocket::new_server(&websocket_context.sec_websocket_key, None, stream);
+    let mut ws = WebSocket::new_server(&websocket_context.sec_websocket_key, None, &mut stream);
     println!("Handshake complete");
+
     loop {
-        let result = ws.read(&mut buffer);
+        let result = ws.read(buffer);
         match result.message_type {
             WebSocketReceiveMessageType::Close => {
-                println!("Connection closed");
+                println!("WebSocket connection closed");
                 break;
             }
             WebSocketReceiveMessageType::Text => {
@@ -98,8 +95,9 @@ fn handle_websocket_request(
     }
 }
 
-fn handle_file_request(header: &HttpHeader, www_root_path: &str, mut stream: TcpStream) {
-    if header.path == "/" {
+// This is really just for demo purposes. Not to be used as a static file server.
+fn handle_file_request(path: &str, www_root_path: &str, mut stream: TcpStream) {
+    if path == "/" {
         let index_file = www_root_path.to_owned() + "\\index.html";
         let index_file = index_file.as_str();
         if let Ok(mut file) = File::open(index_file) {
@@ -118,11 +116,11 @@ fn handle_file_request(header: &HttpHeader, www_root_path: &str, mut stream: Tcp
                 println!("Sent file: {}", index_file);
             }
         } else {
-            println!("File not found: {}", index_file);
+            println!("404 NotFound: {}", index_file);
             send_404(&stream);
         }
     } else {
-        println!("Unknown header path {}", header.path);
+        println!("404 NotFound: {}", path);
         send_404(&stream);
     }
 }
