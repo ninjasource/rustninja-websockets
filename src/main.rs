@@ -50,9 +50,9 @@ fn handle_connection(mut stream: TcpStream, www_root_path: &str) -> Result<(), s
     let header = read_http_header(&mut stream, &mut buffer)?;
 
     if let Some(websocket_context) = header.websocket_context {
-        handle_websocket_request(websocket_context, stream, &mut buffer);
+        handle_websocket_request(websocket_context, stream, &mut buffer)?;
     } else {
-        handle_file_request(&header.path, www_root_path, stream);
+        handle_file_request(&header.path, www_root_path, stream)?;
     }
 
     Ok(())
@@ -62,13 +62,14 @@ fn handle_websocket_request(
     websocket_context: WebSocketContext,
     mut stream: TcpStream,
     buffer: &mut [u8],
-) {
+) -> Result<(), std::io::Error> {
     println!("This is a websocket request. Responding to handshake");
-    let mut ws = WebSocket::new_server(&websocket_context.sec_websocket_key, None, &mut stream);
+    let mut ws = WebSocket::new_server(&websocket_context.sec_websocket_key, None, &mut stream)
+        .expect("Failed to create websocket server");
     println!("Handshake complete");
 
     loop {
-        let result = ws.read(buffer);
+        let result = ws.read(buffer)?;
         match result.message_type {
             WebSocketReceiveMessageType::Close => {
                 println!("WebSocket connection closed");
@@ -82,7 +83,7 @@ fn handle_websocket_request(
                 };
                 println!("Received: {}", s);
                 let to_send = s.as_bytes();
-                ws.write(to_send, to_send.len(), WebSocketSendMessageType::Text, true);
+                ws.write(to_send, to_send.len(), WebSocketSendMessageType::Text, true)?;
                 println!("Sent: {}", s);
             }
             WebSocketReceiveMessageType::Binary => {
@@ -93,10 +94,16 @@ fn handle_websocket_request(
             }
         }
     }
+
+    Ok(())
 }
 
 // This is really just for demo purposes. Not to be used as a static file server.
-fn handle_file_request(path: &str, www_root_path: &str, mut stream: TcpStream) {
+fn handle_file_request(
+    path: &str,
+    www_root_path: &str,
+    mut stream: TcpStream,
+) -> Result<(), std::io::Error> {
     if path == "/" {
         let index_file = www_root_path.to_owned() + "\\index.html";
         let index_file = index_file.as_str();
@@ -123,4 +130,6 @@ fn handle_file_request(path: &str, www_root_path: &str, mut stream: TcpStream) {
         println!("404 NotFound: {}", path);
         send_404(&stream);
     }
+
+    Ok(())
 }
