@@ -385,6 +385,7 @@ fn read_frame<T: Read>(stream: &mut T, buffer: &mut [u8]) -> Result<WebSocketFra
     let is_mask_bit_set = (byte2 & MASK_FLAG) == MASK_FLAG;
     let len = read_length(byte2, stream)?;
 
+    // TODO: we should be able to handle this and allow the user to read multiple times using a small buffer
     if buffer.len() < len {
         panic!(
             "Websocket buffer ({} bytes) too small to fit websocket frame ({} bytes)",
